@@ -31,8 +31,6 @@ func main() {
 }
 ```
 
-Replace `YOUR_USERNAME` with your GitHub username or the username where the repository is hosted.
-
 ## Configuration
 
 You can configure the logger with various settings. Check the `logger.go` file for more details and documentation.
