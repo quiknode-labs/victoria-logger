@@ -41,9 +41,9 @@ If you're hosting this library in a private repository, you might encounter issu
 
 To resolve this, you can configure Go to bypass the proxy and checksum database for this module by setting the `GOPRIVATE` environment variable:
 
-\```bash
+```bash
 export GOPRIVATE=github.com/quiknode-labs/*
-\```
+```
 
 This ensures that Go uses direct git access rather than the proxy and sum database when fetching the module.
 
