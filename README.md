@@ -1,5 +1,5 @@
 
-# VictoriaLogs Hook for Logrus
+# Victoria Logger
 
 This library provides a hook for [Logrus](https://github.com/sirupsen/logrus) to send log entries to VictoriaLogs.
 
@@ -11,7 +11,6 @@ To install the library, use `go get`:
 go get github.com/quiknode-labs/victoria-logger
 ```
 
-Replace `YOUR_USERNAME` with your GitHub username or the username where the repository is hosted.
 
 ## Usage
 
