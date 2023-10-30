@@ -35,6 +35,18 @@ func main() {
 
 You can configure the logger with various settings. Check the `logger.go` file for more details and documentation.
 
+## Using From a Private Repository
+
+If you're hosting this library in a private repository, you might encounter issues when trying to fetch it as a Go module due to Go's default module proxy and sum database not being able to access private repositories.
+
+To resolve this, you can configure Go to bypass the proxy and checksum database for this module by setting the `GOPRIVATE` environment variable:
+
+\```bash
+export GOPRIVATE=github.com/quiknode-labs/*
+\```
+
+This ensures that Go uses direct git access rather than the proxy and sum database when fetching the module.
+
 ## Contributions
 
 Feel free to fork, modify, and submit pull requests. For major changes, please open an issue first to discuss your proposed changes.
