@@ -1,4 +1,3 @@
-
 // Package logger provides a hook for Logrus to send log entries to VictoriaLogs.
 // To use this package, initialize it with the desired configurations, and then use
 // the provided global logger instance for logging.
@@ -13,7 +12,6 @@ package logger
 import (
 	"bytes"
 	"context"
-	"github.com/segmentio/encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -22,7 +20,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/avast/retry-go"
+	"github.com/segmentio/encoding/json"
+
+	retry_v4 "github.com/avast/retry-go/v4"
 	"github.com/sirupsen/logrus"
 )
 
@@ -213,7 +213,7 @@ func (hook *victoriaLogsHook) flush(batch []*logrus.Entry) {
 		buffer.Write([]byte("\n"))
 
 	}
-	err := retry.Do(
+	err := retry_v4.Do(
 		func() error {
 			req, err := http.NewRequest(
 				"POST",
@@ -240,8 +240,11 @@ func (hook *victoriaLogsHook) flush(batch []*logrus.Entry) {
 			}
 			return nil
 		},
-		retry.Attempts(uint(hook.maxRetries)),
-		retry.Delay(hook.retryDelay),
+		retry_v4.Delay(hook.retryDelay),
+		retry_v4.Attempts(uint(hook.maxRetries)),
+		retry_v4.Delay(hook.retryDelay*time.Second),
+		retry_v4.MaxDelay(5*time.Second*hook.retryDelay),
+		retry_v4.MaxJitter(1*time.Second),
 	)
 	buffer.Reset()
 	if err != nil {
