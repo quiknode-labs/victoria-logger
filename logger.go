@@ -294,7 +294,7 @@ func LogFromContext(ctx context.Context) *logrus.Entry {
 	logger, ok := ctx.Value(logKey).(*logrus.Entry)
 	if !ok {
 		// Return a default logger if none is found in the context
-		return logrus.NewEntry(logrus.StandardLogger())
+		return Log
 	}
 	return logger
 }
