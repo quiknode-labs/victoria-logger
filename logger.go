@@ -277,3 +277,24 @@ func healthCheck(url string) error {
 	}
 	return nil
 }
+
+// Define a private type to prevent context key collisions
+type logContextKey struct{}
+
+// logKey is the key for storing the logger in the context
+var logKey = logContextKey{}
+
+// WithLog embeds the logg into the context
+func WithLog(ctx context.Context, logger *logrus.Entry) context.Context {
+	return context.WithValue(ctx, logKey, logger)
+}
+
+// LogFromContext retrieves the log from the context
+func LogFromContext(ctx context.Context) *logrus.Entry {
+	logger, ok := ctx.Value(logKey).(*logrus.Entry)
+	if !ok {
+		// Return a default logger if none is found in the context
+		return logrus.NewEntry(logrus.StandardLogger())
+	}
+	return logger
+}
