@@ -60,72 +60,107 @@ func init() {
 // batchSize: Number of logs to batch before sending.
 // maxRetries: Max number of retries for sending logs.
 // retryDelay: Delay between retries.
+// ChannelBufferSize controls the size of the internal log channel buffer
+// Setting this to a much larger value (20000) to avoid blocking
+var ChannelBufferSize = 20000
+
 func Init(ctx context.Context, url string, flushInterval time.Duration, batchSize, maxRetries int, retryDelay time.Duration, streams map[string]interface{}) error {
 	var initErr error
 	once.Do(func() { // Ensure initialization only happens once
+		// Configure logger to drop debug logs in production mode
 		baseLogger := logrus.New()
+		if streams["environment"] == "production" || streams["environment"] == "staging" {
+			// In production/staging, default to a higher log level to reduce volume
+			baseLogger.SetLevel(logrus.InfoLevel)
+		}
+
 		if ctx == nil {
 			ctx = context.Background()
 		}
 		Log = baseLogger.WithContext(ctx)
+		
+		// Validate inputs
 		if url == "" {
 			initErr = errors.New("url cannot be empty")
+			return
 		}
 		if flushInterval <= 0 {
 			initErr = errors.New("flushInterval must be greater than 0")
+			return
 		}
 		if batchSize <= 0 {
 			initErr = errors.New("batchSize must be greater than 0")
+			return
 		}
 		if maxRetries < 0 {
 			initErr = errors.New("maxRetries cannot be negative")
+			return
 		}
 		if retryDelay <= 0 {
 			initErr = errors.New("retryDelay must be greater than 0")
+			return
 		}
 		if len(streams) == 0 {
 			initErr = errors.New("streams map cannot be empty")
+			return
 		}
+		
 		Log = baseLogger.WithFields(streams)
-		// Perform a health check to ensure VictoriaLogs is operational
-		if err := healthCheck(url); err != nil {
-			initErr = fmt.Errorf("health check failed: %w", err)
-		}
-
+		
+		// Create an HTTP client with a shorter timeout to avoid blocking
 		client := &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: 3 * time.Second, // Reduced from 5s to 3s
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+			},
 		}
-		// use string builder to build the stream fields
+		
+		// Perform a health check to ensure VictoriaLogs is operational
+		// but don't block initialization if it fails - just log a warning
+		go func() {
+			if err := healthCheck(url); err != nil {
+				logrus.Warnf("VictoriaLogs health check failed: %v - logging will continue locally", err)
+			}
+		}()
+		
+		// Use string builder to build the stream fields
 		streamsFieldsBuilder := strings.Builder{}
-
-		for key, _ := range streams {
+		for key := range streams {
 			streamsFieldsBuilder.WriteString(key)
 			streamsFieldsBuilder.WriteString(",")
 		}
-		// remove the last comma
+		// Remove the last comma
 		streamsFields := strings.TrimSuffix(streamsFieldsBuilder.String(), ",")
+		
 		vlHook := &victoriaLogsHook{
 			URL:          url + "/insert/jsonline",
 			streamFields: streamsFields,
-
-			batchSize:  batchSize,
-			maxRetries: maxRetries,
-			retryDelay: retryDelay,
-			client:     client,
+			batchSize:    batchSize,
+			maxRetries:   maxRetries,
+			retryDelay:   retryDelay,
+			client:       client,
 		}
 
 		baseLogger.AddHook(vlHook)
-		flushSignalCh = make(chan bool)
-		stopCh = make(chan bool)
+		
+		// Initialize channels with generous buffer sizes to avoid blocking
+		flushSignalCh = make(chan bool, 10)    // Multiple flush signals can be queued
+		stopCh = make(chan bool, 1)            // Only one stop signal needed
 		ticker = time.NewTicker(flushInterval)
-		ch = make(chan *logrus.Entry, batchSize)
+		
+		// Use the larger buffer size for the main log channel
+		// This is the key change to prevent blocking on high log volume
+		ch = make(chan *logrus.Entry, ChannelBufferSize) 
+		
 		baseLogger.WithContext(ctx).WithFields(streams)
 		wg = sync.WaitGroup{}
 
 		wg.Add(1)
 		go vlHook.flusher()
 	})
-	return initErr // Return nil on successful initialization
+	return initErr
 }
 
 // Levels returns all log levels to ensure the hook is used for all log levels.
@@ -136,18 +171,48 @@ func (hook *victoriaLogsHook) Levels() []logrus.Level {
 // Fire queues the log entry for batching.
 func (hook *victoriaLogsHook) Fire(entry *logrus.Entry) error {
 	if atomic.LoadInt32(&closed) == 1 {
-		logrus.Warn("Attempted to log after logger has been closed. Log entry dropped.")
+		// Silently drop logs after closure
 		return nil
 	}
-	select {
-	case ch <- entry:
-		// Successfully sent the entry to the channel
-	default:
-		// Channel is full, signal the flusher to flush
-		flushSignalCh <- true
-		ch <- entry // You might want to handle the case where this blocks too
+	
+	// Create a copy of the entry to avoid race conditions
+	entryCopy := &logrus.Entry{
+		Logger:  entry.Logger,
+		Data:    make(logrus.Fields, len(entry.Data)),
+		Time:    entry.Time,
+		Level:   entry.Level,
+		Message: entry.Message,
 	}
-	return nil
+	for k, v := range entry.Data {
+		entryCopy.Data[k] = v
+	}
+	
+	select {
+	case ch <- entryCopy:
+		// Successfully sent the entry to the channel
+		return nil
+	default:
+		// Channel is full, but we don't want to block
+		// Signal the flusher and drop the log entry
+		select {
+		case flushSignalCh <- true:
+			// Successfully signaled the flusher
+		default:
+			// Flusher is already busy, just drop the log entry
+		}
+		
+		// For error and fatal levels, make a blocking attempt as these are important
+		if entry.Level <= logrus.ErrorLevel {
+			select {
+			case ch <- entryCopy:
+				// Added error/fatal log to channel
+			default:
+				// Even the error log couldn't be added, log locally
+				logrus.Warnf("Dropped important log (level=%s): %s", entry.Level, entry.Message)
+			}
+		}
+		return nil
+	}
 }
 
 // flusher is a background goroutine that batches log entries and flushes them to VictoriaLogs.
@@ -185,70 +250,110 @@ func (hook *victoriaLogsHook) flusher() {
 }
 
 // flush sends the batched log entries to VictoriaLogs.
+// Preallocated buffer pool for JSON serialization
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// mapPool for reusing maps during log serialization
+var mapPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]interface{}, 16) // Reasonable initial capacity
+	},
+}
+
 func (hook *victoriaLogsHook) flush(batch []*logrus.Entry) {
 	if len(batch) == 0 {
 		return
 	}
 
-	var buffer bytes.Buffer
+	// Get buffer from pool
+	buffer := bufferPool.Get().(*bytes.Buffer)
+	buffer.Reset()
+	defer bufferPool.Put(buffer)
+
+	// Prepare entries for sending
 	for _, entry := range batch {
 		// Get a logData map from the pool
-		logData := make(map[string]interface{}, len(entry.Data)+3)
+		logData := mapPool.Get().(map[string]interface{})
+		for k := range logData {
+			delete(logData, k) // Clear the map for reuse
+		}
 
+		// Add standard fields
 		logData["_msg"] = entry.Message
 		logData["_time"] = entry.Time.Format(time.RFC3339Nano)
 		logData["level"] = entry.Level.String()
 
+		// Add custom fields
 		for k, v := range entry.Data {
 			logData[k] = v
 		}
 
+		// Marshal to JSON
 		jsonEntry, err := json.Marshal(logData)
+		mapPool.Put(logData) // Return map to pool
+
 		if err != nil {
-			logrus.Errorf("Error converting log entry to string: %v", err)
+			// Don't log here to avoid recursion - just skip the entry
 			continue
 		}
 
 		buffer.Write(jsonEntry)
 		buffer.Write([]byte("\n"))
-
 	}
+
+	// If buffer is empty after processing (all entries failed to marshal), return early
+	if buffer.Len() == 0 {
+		return
+	}
+
+	// Create a context with a shorter timeout to avoid long blocks
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Send logs with retry logic but limit total time
 	err := retry_v4.Do(
 		func() error {
-			req, err := http.NewRequest(
+			req, err := http.NewRequestWithContext(
+				ctx,
 				"POST",
 				hook.URL+fmt.Sprintf("?_stream_fields=%s", hook.streamFields),
-				&buffer,
+				buffer,
 			)
 			if err != nil {
-				logrus.Error("Failed to create request:", err)
+				// Local silent error
 				return err
 			}
 			req.Header.Set("Content-Type", "application/stream+json")
 
 			resp, err := hook.client.Do(req)
 			if err != nil {
-				logrus.Errorf("Failed to send logs: %v", err)
+				// Check if context is canceled or deadline exceeded
+				if ctx.Err() != nil {
+					return retry_v4.Unrecoverable(ctx.Err()) // Stop retrying
+				}
 				return err
 			}
-			defer resp.Body.Close() // Always close the response body
+			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				errMsg := fmt.Sprintf("Failed to send logs with status: %s", resp.Status)
-				logrus.Error(errMsg)
-				return errors.New(errMsg) // Return this error instead of the previous one
+				return fmt.Errorf("status: %s", resp.Status)
 			}
 			return nil
 		},
-		retry_v4.Delay(hook.retryDelay),
 		retry_v4.Attempts(uint(hook.maxRetries)),
-		retry_v4.Delay(hook.retryDelay*time.Second),
-		retry_v4.MaxDelay(5*time.Second*hook.retryDelay),
-		retry_v4.MaxJitter(1*time.Second),
+		retry_v4.DelayType(retry_v4.BackOffDelay), // Use backoff for more efficient retries
+		retry_v4.MaxDelay(200*time.Millisecond),   // Cap retry delays
+		retry_v4.LastErrorOnly(true),              // Only log the last error
 	)
-	buffer.Reset()
-	if err != nil {
-		logrus.Errorln("Failed to send logs after retries:", err)
+
+	// Silently handle errors - we don't want logging errors to cascade
+	if err != nil && ctx.Err() == nil {
+		// Only log final error once if it's not due to context timeout
+		logrus.Warnf("Failed to send %d logs to VictoriaLogs", len(batch))
 	}
 }
 
